@@ -1,16 +1,16 @@
 language: groovy
 env:
   - GROOVY_VERSION="2.4.9"
-  
+
 matrix:
   allow_failures:
   - env: GROOVY_VERSION="2.4.9"
-  
+
 branches:
   only:
     - master
     - dev
-	
+
 jenkins:
   collect:
     artifacts: build/libs/*.jar
