@@ -5,53 +5,11 @@ import net.gleske.jervis.lang.lifecycleGenerator
 import net.gleske.jervis.remotes.GitHub
 
 def git_service = new GitHub()
-//Pre-job setup based on the type of remote
-switch(git_service) {
-    case GitHub:
-        //authenticate
-        if(System.getenv('GITHUB_TOKEN')) {
-            println 'Found GITHUB_TOKEN environment variable.'
-            git_service.gh_token = System.getenv('GITHUB_TOKEN')
-        }
-        //GitHub Enterprise web URL; otherwise it will simply be github.com
-        if(System.getenv('GITHUB_URL')) {
-            println 'Found GITHUB_URL environment variable.'
-            git_service.gh_web = System.getenv('GITHUB_URL')
-        }
-}
-
-//Get credentials from a folder
-public String getFolderRSAKeyCredentials(String folder, String credentials_id) {
-    if(folder.equals('') || credentials_id.equals('')) {
-        return ''
-    }
-    def credentials
-    def properties = Jenkins.getInstance().getJob(folder).getProperties()
-    for(int i=0; i < properties.size(); i++) {
-        if(properties.get(i).getClass().getSimpleName() == 'FolderCredentialsProperty') {
-            credentials = properties.get(i)
-        }
-    }
-    String found_credentials = ''
-    if(credentials != null ) {
-        credentials.getDomainCredentials().each { domain ->
-            domain.getCredentials().each { credential ->
-                if(credential != null && credential.getClass().getSimpleName() == 'BasicSSHUserPrivateKey') {
-                    if(credential.getId() == credentials_id) {
-                        found_credentials = credential.getPrivateKey()
-                    }
-                }
-            }
-        }
-    }
-    return found_credentials
-}
-
 //generate Jenkins jobs
 def generate_project_for(def git_service, String JERVIS_BRANCH) {
     //def JERVIS_BRANCH = it
     def folder_listing = git_service.getFolderListing(project, '/', JERVIS_BRANCH)
-    def generator = new lifecycleGenerator()
+	def generator = new lifecycleGenerator()
     String jervis_yaml
     if('.jervis.yml' in folder_listing) {
         jervis_yaml = git_service.getFile(project, '.jervis.yml', JERVIS_BRANCH)
@@ -64,10 +22,7 @@ def generate_project_for(def git_service, String JERVIS_BRANCH) {
         println "Skipping branch: ${JERVIS_BRANCH}"
         return
     }
-    //try detecting no default language and setting to ruby
-    if(jervis_yaml.indexOf('language:') < 0) {
-        generator.yaml_language = 'ruby'
-    }
+	
     generator.loadPlatformsString(readFileFromWorkspace('src/main/resources/platforms.json').toString())
     generator.preloadYamlString(jervis_yaml)
     //could optionally read lifecycles and toolchains files by OS
@@ -75,36 +30,7 @@ def generate_project_for(def git_service, String JERVIS_BRANCH) {
     generator.loadToolchainsString(readFileFromWorkspace('src/main/resources/toolchains.json').toString())
     generator.loadYamlString(jervis_yaml)
     String project_folder = "${project}".split('/')[0]
-    //attempt to get the private key else return an empty string
-    String credentials_id = generator.getObjectValue(generator.jervis_yaml, 'jenkins.secrets_id', '')
-    String private_key_contents = getFolderRSAKeyCredentials(project_folder, credentials_id)
-    //try decrypting secrets
-    if(credentials_id.size() > 0 && private_key_contents.size() == 0) {
-        throw new SecurityException("Could not find private key using Jenkins Credentials ID: ${credentials_id}")
-    }
-    if(private_key_contents.size() > 0) {
-        println "Attempting to decrypt jenkins.secrets using Jenkins Credentials ID ${credentials_id}."
-        File priv_key = File.createTempFile('temp', '.txt')
-        //delete file if JVM is shut down
-        priv_key.deleteOnExit()
-        try {
-            priv_key.write(private_key_contents)
-            generator.setPrivateKeyPath(priv_key.getAbsolutePath())
-            generator.decryptSecrets()
-        }
-        catch(Throwable t) {
-            //clean up temp file
-            priv_key.delete()
-            //rethrow caught throwable
-            throw t
-        }
-        //done decrypting so clean up the private key
-        priv_key.delete()
-        //print a list of the keys attempting to be decrypted
-        println "Decrypted the following properties (indented):"
-        generator.plainlist*.get('key').each { println "    ${it}" }
-    }
-    //end decrypting secrets
+    
     generator.folder_listing = folder_listing
     if(!generator.isGenerateBranch(JERVIS_BRANCH)) {
         //the job should not be generated for this branch
@@ -126,7 +52,6 @@ def generate_project_for(def git_service, String JERVIS_BRANCH) {
         displayName("${project_name} (${JERVIS_BRANCH} branch)")
         label(generator.getLabels())
         if(generator.isMatrixBuild()) {
-            //workaround for matrix builds ref: https://github.com/jenkinsci/docker-plugin/issues/242
             properties {
                 groovyLabelAssignmentProperty {
                     secureGroovyScript {
@@ -147,11 +72,10 @@ def generate_project_for(def git_service, String JERVIS_BRANCH) {
             }
         }
         scm {
-            //see https://github.com/jenkinsci/job-dsl-plugin/pull/108
-            //for more info about the git closure
             git {
                 remote {
                     url(git_service.getCloneUrl() + "${project}.git")
+					credentials(generator.getObjectValue(generator.jervis_yaml, 'jenkins.credential_id', ''))
                 }
                 branch("refs/heads/${JERVIS_BRANCH}")
                 //configure git web browser based on the type of remote
@@ -181,37 +105,23 @@ def generate_project_for(def git_service, String JERVIS_BRANCH) {
             combinationFilter(generator.matrixExcludeFilter())
         }
         publishers {
-            String[] enabled_collections = generator.getObjectValue(generator.jervis_yaml, 'jenkins.collect', [:]).keySet() as String[]
-            if('artifacts' in enabled_collections) {
-                //artifact lists as a single string or a list in YAML
-                def collect_artifacts = generator.getObjectValue(generator.jervis_yaml, 'jenkins.collect.artifacts', new Object())
-                collect_artifacts = (collect_artifacts instanceof List)? collect_artifacts.join(',') : collect_artifacts.toString()
-                if(collect_artifacts.size() > 1) {
-                    archiveArtifacts {
-                        fingerprint(true)
-                        onlyIfSuccessful(true)
-                        pattern(collect_artifacts)
-                    }
-                }
-            }
-            if('junit' in enabled_collections) {
-                String collect_junit = generator.getObjectValue(generator.jervis_yaml, 'jenkins.collect.junit', '')
-                if(collect_junit.size() > 0) {
-                    archiveJunit(collect_junit)
-                }
-            }
-            if('cobertura' in enabled_collections) {
-                String collect_cobertura = generator.getObjectValue(generator.jervis_yaml, 'jenkins.collect.cobertura', '')
-                if(collect_cobertura.size() > 0) {
-                    cobertura(collect_cobertura)
-                    covComplPlotPublisher {
-                        analyzer 'Cobertura'
-                        excludeGetterSetter false
-                        verbose false
-                        locateTopMost true
-                    }
-                }
-            }
+			extendedEmail {
+				recipientList(generator.getObjectValue(generator.jervis_yaml, 'jenkins.email.recepients', '') as String[])
+				defaultSubject("AARive-Deployment")
+				attachBuildLog(true)
+				triggers {
+					failure {
+						sendTo {
+							recipientList()
+						}
+					}
+					success {
+						sendTo {
+							recipientList()
+						}
+					}
+				}
+			}
         }
     }
 }
